@@ -7,6 +7,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, joinedload
 
 from app.database import get_db
+from app.auth import require_admin
 from app.models.category import Category
 from app.models.post import Post, PostStatus
 from app.schemas.post import PostCreate, PostListResponse, PostResponse, PostUpdate
@@ -64,7 +65,11 @@ def get_post(slug: str, db: Session = Depends(get_db)) -> Post:
 
 
 @router.post("", response_model=PostResponse, status_code=status.HTTP_201_CREATED)
-def create_post(payload: PostCreate, db: Session = Depends(get_db)) -> Post:
+def create_post(
+    payload: PostCreate,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_admin),
+) -> Post:
     try:
         post = create_article(db, payload)
         db.commit()
@@ -79,7 +84,12 @@ def create_post(payload: PostCreate, db: Session = Depends(get_db)) -> Post:
 
 
 @router.put("/{post_id}", response_model=PostResponse)
-def update_post(post_id: int, payload: PostUpdate, db: Session = Depends(get_db)) -> Post:
+def update_post(
+    post_id: int,
+    payload: PostUpdate,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_admin),
+) -> Post:
     existing_post = db.get(Post, post_id)
     if existing_post is None:
         raise HTTPException(status_code=404, detail="Article not found")
@@ -97,7 +107,11 @@ def update_post(post_id: int, payload: PostUpdate, db: Session = Depends(get_db)
 
 
 @router.delete("/{post_id}", status_code=status.HTTP_204_NO_CONTENT)
-def delete_post(post_id: int, db: Session = Depends(get_db)) -> Response:
+def delete_post(
+    post_id: int,
+    db: Session = Depends(get_db),
+    _: None = Depends(require_admin),
+) -> Response:
     post = db.get(Post, post_id)
     if post is None:
         raise HTTPException(status_code=404, detail="Article not found")
