@@ -6,6 +6,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     database_url: SecretStr
+    admin_api_key: SecretStr | None = None
     cors_origins: str = "http://localhost:3000,http://127.0.0.1:3000"
     telegram_bot_token: SecretStr | None = None
     telegram_webhook_secret: SecretStr | None = None
