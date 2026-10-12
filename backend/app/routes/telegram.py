@@ -197,6 +197,9 @@ async def telegram_webhook(
         else ""
     )
 
+    print("Webhook secret configured:", bool(expected_secret))
+    print("Webhook secret matches:", bool(provided_secret) and hmac.compare_digest(provided_secret.encode("utf-8"), expected_secret.encode("utf-8")))
+
     if not expected_secret or not hmac.compare_digest(
         provided_secret.encode("utf-8"),
         expected_secret.encode("utf-8"),
