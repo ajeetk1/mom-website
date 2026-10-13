@@ -625,7 +625,11 @@ async def telegram_webhook(
                 detail="The photo could not be saved to the draft",
             ) from None
 
-        if pending_post.post_type == PostType.ARCHIVE:
+        
+        if pending_post.post_type in (
+            PostType.ARCHIVE,
+            PostType.FEATURED,
+        ):
             return await _save_post_step(
                 db=db,
                 update_id=payload.update_id,
