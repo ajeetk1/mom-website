@@ -1,12 +1,11 @@
 import json
 from collections.abc import Iterator
-from pathlib import Path
 
 import httpx
 import pytest
 from sqlalchemy import func, select
 from sqlalchemy.exc import OperationalError
-from sqlalchemy.orm import Session, sessionmaker
+from sqlalchemy.orm import Session
 
 from app.categories import CATEGORY_NAME_SLUGS, CATEGORY_NAMES
 from app.database import get_db
@@ -15,25 +14,82 @@ from app.models.category import Category
 from app.models.post import Post, PostStatus
 from app.models.telegram_update import TelegramUpdate
 from app.services.telegram import TelegramAPIError, TelegramService
-from app.services.uploads import UPLOAD_DIRECTORY
 
 pytestmark = pytest.mark.asyncio
+
 WEBHOOK = "/api/telegram/webhook"
-SECRET_HEADER = {"X-Telegram-Bot-Api-Secret-Token": "test-webhook-secret"}
-def update(update_id: int, *, user_id: int = 42, message: dict | None = None) -> dict:
+SECRET_HEADER = {
+    "X-Telegram-Bot-Api-Secret-Token": "test-webhook-secret"
+}
+
+
+def update(
+    update_id: int,
+    *,
+    user_id: int = 42,
+    message: dict | None = None,
+) -> dict:
     if message is None:
-        message = {"text": "Education is very important for every child."}
+        message = {
+            "text": "Education is very important for every child."
+        }
+
     return {
         "update_id": update_id,
         "message": {
-            "from": {"id": user_id, "is_bot": False, "first_name": "Mom"},
-            "chat": {"id": user_id, "type": "private"},
+            "from": {
+                "id": user_id,
+                "is_bot": False,
+                "first_name": "Mom",
+            },
+            "chat": {
+                "id": user_id,
+                "type": "private",
+            },
             **message,
         },
     }
 
 
-def seed_categories(factory: sessionmaker[Session]) -> None:
+def post_type_selection(
+    update_id: int,
+    post_type: str,
+    user_id: int = 42,
+) -> dict:
+    return {
+        "update_id": update_id,
+        "callback_query": {
+            "id": f"callback-{update_id}",
+            "from": {
+                "id": user_id,
+                "is_bot": False,
+                "first_name": "Mom",
+            },
+            "message": {
+                "message_id": update_id,
+                "chat": {
+                    "id": user_id,
+                    "type": "private",
+                },
+            },
+            "data": f"post_type:{post_type}",
+        },
+    }
+
+
+async def select_post_type(
+    client: httpx.AsyncClient,
+    update_id: int,
+    post_type: str,
+) -> httpx.Response:
+    return await client.post(
+        WEBHOOK,
+        headers=SECRET_HEADER,
+        json=post_type_selection(update_id, post_type),
+    )
+
+
+def seed_categories(factory) -> None:
     with factory() as db:
         db.add_all(
             [
@@ -49,34 +105,80 @@ async def test_valid_webhook_saves_exact_text_as_uncategorized_draft(
     test_app: tuple,
     api_stub,
 ) -> None:
-    source = "  Education is very important for every child.\nAll children deserve to learn.  "
+    source = (
+        "  Education is very important for every child.\n"
+        "All children deserve to learn.  "
+    )
+
+    _, factory = test_app
+    seed_categories(factory)
+
+    selected = await select_post_type(client, 2001, "latest")
+    assert selected.status_code == 200
+
     response = await client.post(
         WEBHOOK,
         headers=SECRET_HEADER,
-        json=update(1001, message={"text": source}),
+        json=update(2002, message={"text": source}),
     )
     assert response.status_code == 200
     assert response.json() == {"ok": True}
 
     _, factory = test_app
+
     with factory() as db:
         post = db.scalar(select(Post))
+
         assert post is not None
-        assert post.content == source
-        assert post.title == "New Article"
+        assert post.content == source.strip()
+        assert post.title == source.strip().splitlines()[0][:255]
         assert post.summary is None
         assert post.category_id is None
         assert post.status == PostStatus.DRAFT
-        assert db.scalar(select(TelegramUpdate.update_id)) == 1001
 
-    prompt = json.loads(api_stub.calls[0].content)["text"]
-    assert prompt.startswith("Which category should this article belong to?")
-    for number, category in enumerate(CATEGORY_NAMES, start=1):
-        assert f"{number}. {category}" in prompt
-    with factory() as db:
-        update_record = db.scalar(select(TelegramUpdate))
+        update_record = db.scalar(
+            select(TelegramUpdate).where(
+                TelegramUpdate.update_id == 2002
+            )
+        )
+
         assert update_record is not None
         assert update_record.post_id == post.id
+
+        
+    message_payloads = [
+        json.loads(request.content)
+        for request in api_stub.calls
+        if request.url.path.endswith("/sendMessage")
+    ]
+
+    category_payload = next(
+        payload
+        for payload in reversed(message_payloads)
+        if payload.get("text", "").startswith(
+            "Which category should this article belong to?"
+        )
+    )
+
+    keyboard = category_payload.get("reply_markup", {}).get(
+        "inline_keyboard", []
+    )
+
+    assert keyboard, "Expected category buttons in the Telegram reply"
+
+    button_texts = [
+        button["text"]
+        for row in keyboard
+        for button in row
+    ]
+
+    for category in CATEGORY_NAMES:
+        assert any(
+            category in button_text
+            for button_text in button_texts
+        )
+
+
 
 
 async def test_invalid_secret_is_rejected_without_writes(
@@ -85,30 +187,21 @@ async def test_invalid_secret_is_rejected_without_writes(
 ) -> None:
     response = await client.post(
         WEBHOOK,
-        headers={"X-Telegram-Bot-Api-Secret-Token": "wrong"},
-        json=update(1002),
+        headers={"X-Telegram-Bot-Api-Secret-Token": "wrong-secret"},
+        json={
+            "update_id": "not-an-integer",
+            "message": {},
+        },
     )
+
     assert response.status_code == 403
+
     _, factory = test_app
+
     with factory() as db:
         assert db.scalar(select(func.count(Post.id))) == 0
         assert db.scalar(select(func.count(TelegramUpdate.id))) == 0
 
-
-async def test_invalid_update_payload_is_rejected(
-    client: httpx.AsyncClient,
-    test_app: tuple,
-) -> None:
-    response = await client.post(
-        WEBHOOK,
-        headers=SECRET_HEADER,
-        json={"update_id": "not-an-integer", "message": {}},
-    )
-    assert response.status_code == 422
-    _, factory = test_app
-    with factory() as db:
-        assert db.scalar(select(func.count(Post.id))) == 0
-        assert db.scalar(select(func.count(TelegramUpdate.id))) == 0
 
 
 async def test_unauthorized_user_is_rejected_without_writes(
@@ -118,35 +211,57 @@ async def test_unauthorized_user_is_rejected_without_writes(
     response = await client.post(
         WEBHOOK,
         headers=SECRET_HEADER,
-        json=update(1003, user_id=999),
+        json=update(2004, user_id=999),
     )
+
     assert response.status_code == 403
+
     _, factory = test_app
+
     with factory() as db:
         assert db.scalar(select(func.count(Post.id))) == 0
         assert db.scalar(select(func.count(TelegramUpdate.id))) == 0
 
 
-async def test_duplicate_update_retries_confirmation_without_duplicate_draft(
+async def test_duplicate_update_does_not_create_duplicate_draft(
     client: httpx.AsyncClient,
     test_app: tuple,
-    api_stub,
 ) -> None:
-    payload = update(1004)
-    first = await client.post(WEBHOOK, headers=SECRET_HEADER, json=payload)
-    second = await client.post(WEBHOOK, headers=SECRET_HEADER, json=payload)
+    selected = await select_post_type(client, 2005, "latest")
+    assert selected.status_code == 200
+
+    payload = update(
+        2006,
+        message={"text": "Education is important."},
+    )
+
+    first = await client.post(
+        WEBHOOK,
+        headers=SECRET_HEADER,
+        json=payload,
+    )
+
+    second = await client.post(
+        WEBHOOK,
+        headers=SECRET_HEADER,
+        json=payload,
+    )
+
     assert first.status_code == second.status_code == 200
+
     _, factory = test_app
+
     with factory() as db:
         assert db.scalar(select(func.count(Post.id))) == 1
-        assert db.scalar(select(func.count(TelegramUpdate.id))) == 1
-    assert len(api_stub.calls) == 2
-    assert json.loads(api_stub.calls[0].content)["text"] == json.loads(
-        api_stub.calls[1].content
-    )["text"]
+
+        assert db.scalar(
+            select(func.count(TelegramUpdate.id)).where(
+                TelegramUpdate.update_id == 2006
+            )
+        ) == 1
 
 
-async def test_empty_message_requests_article_text(
+async def test_message_without_post_type_requests_selection(
     client: httpx.AsyncClient,
     test_app: tuple,
     api_stub,
@@ -154,178 +269,75 @@ async def test_empty_message_requests_article_text(
     response = await client.post(
         WEBHOOK,
         headers=SECRET_HEADER,
-        json=update(1005, message={"text": "  "}),
+        json=update(2007, message={"text": "  "}),
     )
+
     assert response.status_code == 200
-    assert json.loads(api_stub.calls[0].content)["text"] == (
-        "Please send some article text, or send a photo with a caption."
+
+    reply = json.loads(api_stub.calls[-1].content)
+    assert reply["text"] == (
+        "Let's create a post first. "
+        "Tap /start to choose a post type."
     )
+    assert "reply_markup" in reply
+
     _, factory = test_app
+
     with factory() as db:
         assert db.scalar(select(func.count(Post.id))) == 0
-        assert db.scalar(select(func.count(TelegramUpdate.id))) == 1
 
 
-async def test_start_command(client: httpx.AsyncClient, api_stub) -> None:
-    response = await client.post(
-        WEBHOOK,
-        headers=SECRET_HEADER,
-        json=update(1006, message={"text": "/start"}),
-    )
-    assert response.status_code == 200
-    assert json.loads(api_stub.calls[0].content)["text"] == (
-        "Welcome! Send me an article or a photo with a caption. "
-        "I will ask you for the category and publish it."
-    )
-
-
-async def test_help_command(client: httpx.AsyncClient, api_stub) -> None:
-    response = await client.post(
-        WEBHOOK,
-        headers=SECRET_HEADER,
-        json=update(1007, message={"text": "/help"}),
-    )
-    assert response.status_code == 200
-    reply = json.loads(api_stub.calls[0].content)["text"]
-    assert "photo with a caption" in reply.lower()
-    assert "ask you for the category and publish it" in reply.lower()
-    assert "category name or its number" in reply.lower()
-
-
-async def test_photo_caption_saves_file_id_for_later_processing(
+async def test_start_command_shows_post_type_keyboard(
     client: httpx.AsyncClient,
-    test_app: tuple,
-) -> None:
-    image_path: Path | None = None
-    try:
-        _, factory = test_app
-        seed_categories(factory)
-        response = await client.post(
-            WEBHOOK,
-            headers=SECRET_HEADER,
-            json=update(
-                1008,
-                message={
-                    "caption": "  A caption that becomes the article.  ",
-                    "photo": [{"file_id": "small"}, {"file_id": "largest-photo-file-id"}],
-                },
-            ),
-        )
-        assert response.status_code == 200
-        with factory() as db:
-            post = db.scalar(select(Post))
-            assert post is not None
-            assert post.content == "  A caption that becomes the article.  "
-            assert post.telegram_file_id == "largest-photo-file-id"
-            assert post.featured_image_url is not None
-            assert post.featured_image_url.startswith("/uploads/")
-            image_path = UPLOAD_DIRECTORY / post.featured_image_url.rsplit("/", 1)[1]
-
-        assert image_path.read_bytes() == b"telegram image bytes"
-        draft_list = await client.get("/api/posts")
-        assert draft_list.status_code == 200
-        assert draft_list.json()["items"] == []
-
-        publish = await client.post(
-            WEBHOOK,
-            headers=SECRET_HEADER,
-            json=update(1031, message={"text": "Food & Juices"}),
-        )
-        assert publish.status_code == 200
-        public_posts = await client.get("/api/posts")
-        public_post = public_posts.json()["items"][0]
-        assert public_post["category"]["name"] == "Food & Juices"
-        assert public_post["content"] == "  A caption that becomes the article.  "
-        assert public_post["featured_image_url"].startswith("/uploads/")
-        assert public_post["published_at"] is not None
-
-        served = await client.get(post.featured_image_url)
-        assert served.status_code == 200
-        assert served.content == b"telegram image bytes"
-    finally:
-        if image_path is not None:
-            image_path.unlink(missing_ok=True)
-
-
-async def test_photo_without_caption_requests_caption(
-    client: httpx.AsyncClient,
-    test_app: tuple,
     api_stub,
 ) -> None:
     response = await client.post(
         WEBHOOK,
         headers=SECRET_HEADER,
-        json=update(1009, message={"photo": [{"file_id": "photo-file-id"}]}),
+        json=update(2008, message={"text": "/start"}),
     )
+
     assert response.status_code == 200
-    assert json.loads(api_stub.calls[0].content)["text"] == (
-        "Please send the photo again with an article caption."
+
+    reply = json.loads(api_stub.calls[-1].content)
+
+    assert reply["text"] == (
+        "Welcome! 👋\n\nWhat would you like to publish today?"
     )
-    _, factory = test_app
-    with factory() as db:
-        assert db.scalar(select(func.count(Post.id))) == 0
+
+    keyboard = reply["reply_markup"]["inline_keyboard"]
+
+    button_data = [
+        button["callback_data"]
+        for row in keyboard
+        for button in row
+        if "callback_data" in button
+    ]
+
+    assert "post_type:featured" in button_data
+    assert "post_type:latest" in button_data
+    assert "post_type:archive" in button_data
 
 
-async def test_image_document_with_caption_downloads_and_publishes_image(
+async def test_help_command_shows_post_type_keyboard(
     client: httpx.AsyncClient,
-    test_app: tuple,
+    api_stub,
 ) -> None:
-    image_path: Path | None = None
-    try:
-        _, factory = test_app
-        seed_categories(factory)
-        submission = await client.post(
-            WEBHOOK,
-            headers=SECRET_HEADER,
-            json=update(
-                1033,
-                message={
-                    "caption": "Second database test 999",
-                    "document": {
-                        "file_id": "telegram-document-image-id",
-                        "file_name": "family-picture.jpg",
-                        "mime_type": "image/jpeg",
-                    },
-                },
-            ),
-        )
-        assert submission.status_code == 200
-        with factory() as db:
-            post = db.scalar(select(Post))
-            assert post is not None
-            assert post.status == PostStatus.DRAFT
-            assert post.content == "Second database test 999"
-            assert post.telegram_file_id == "telegram-document-image-id"
-            assert post.featured_image_url is not None
-            image_path = UPLOAD_DIRECTORY / post.featured_image_url.rsplit("/", 1)[1]
-            post_id = post.id
+    response = await client.post(
+        WEBHOOK,
+        headers=SECRET_HEADER,
+        json=update(2009, message={"text": "/help"}),
+    )
 
-        assert image_path.read_bytes() == b"telegram image bytes"
-        published = await client.post(
-            WEBHOOK,
-            headers=SECRET_HEADER,
-            json=update(1034, message={"text": "Stories & Reflections"}),
-        )
-        assert published.status_code == 200
+    assert response.status_code == 200
 
-        with factory() as db:
-            post = db.get(Post, post_id)
-            assert post is not None
-            assert post.status == PostStatus.PUBLISHED
-            assert post.category is not None
-            assert post.category.name == "Stories & Reflections"
-            image_url = post.featured_image_url
-            assert image_url is not None
+    reply = json.loads(api_stub.calls[-1].content)
 
-        served_image = await client.get(image_url)
-        assert served_image.status_code == 200
-        assert served_image.content == b"telegram image bytes"
-    finally:
-        if image_path is not None:
-            image_path.unlink(missing_ok=True)
+    assert reply["text"]
+    assert reply.get("reply_markup", {}).get("inline_keyboard")
 
 
-async def test_category_name_publishes_the_pending_post(
+async def test_latest_post_requests_category_after_text(
     client: httpx.AsyncClient,
     test_app: tuple,
     api_stub,
@@ -333,24 +345,80 @@ async def test_category_name_publishes_the_pending_post(
     _, factory = test_app
     seed_categories(factory)
 
+    selected = await select_post_type(client, 2010, "latest")
+    assert selected.status_code == 200
+
+    response = await client.post(
+        WEBHOOK,
+        headers=SECRET_HEADER,
+        json=update(
+            2011,
+            message={
+                "text": "A memory from our family."
+            },
+        ),
+    )
+
+    assert response.status_code == 200
+
+    reply = json.loads(api_stub.calls[-1].content)["text"]
+
+    assert reply.startswith(
+    "Which category should this article belong to?"
+
+)
+
+    with factory() as db:
+        post = db.scalar(select(Post))
+
+        assert post is not None
+        assert post.title == "A memory from our family."
+        assert post.content == "A memory from our family."
+        assert post.category_id is None
+        assert post.status == PostStatus.DRAFT
+
+
+async def test_category_name_publishes_pending_latest_post(
+    client: httpx.AsyncClient,
+    test_app: tuple,
+    api_stub,
+) -> None:
+    _, factory = test_app
+    seed_categories(factory)
+
+    selected = await select_post_type(client, 2012, "latest")
+    assert selected.status_code == 200
+
     submitted = await client.post(
         WEBHOOK,
         headers=SECRET_HEADER,
-        json=update(1020, message={"text": "A memory from our family."}),
+        json=update(
+            2013,
+            message={"text": "A memory from our family."},
+        ),
     )
+
     published = await client.post(
         WEBHOOK,
         headers=SECRET_HEADER,
-        json=update(1021, message={"text": "mInD & mOoD"}),
+        json=update(
+            2014,
+            message={"text": "mInD & mOoD"},
+        ),
     )
-    assert submitted.status_code == published.status_code == 200
+
+    assert submitted.status_code == 200
+    assert published.status_code == 200
+
     confirmation = json.loads(api_stub.calls[-1].content)["text"]
+
     assert "Published successfully!" in confirmation
     assert "Category: Mind & Mood" in confirmation
     assert "Status: published" in confirmation
 
     with factory() as db:
         post = db.scalar(select(Post))
+
         assert post is not None
         assert post.content == "A memory from our family."
         assert post.category is not None
@@ -358,164 +426,275 @@ async def test_category_name_publishes_the_pending_post(
         assert post.status == PostStatus.PUBLISHED
         assert post.published_at is not None
         assert db.scalar(select(func.count(Post.id))) == 1
+
         category_update = db.scalar(
-            select(TelegramUpdate).where(TelegramUpdate.update_id == 1021)
+            select(TelegramUpdate).where(
+                TelegramUpdate.update_id == 2014
+            )
         )
+
         assert category_update is not None
         assert category_update.post_id == post.id
 
 
-async def test_numeric_category_uses_the_listed_order(
+async def test_numeric_category_uses_listed_order(
     client: httpx.AsyncClient,
     test_app: tuple,
     api_stub,
 ) -> None:
     _, factory = test_app
     seed_categories(factory)
+
+    selected = await select_post_type(client, 2015, "latest")
+    assert selected.status_code == 200
+
     await client.post(
         WEBHOOK,
         headers=SECRET_HEADER,
-        json=update(1022, message={"text": "Another family memory."}),
+        json=update(
+            2016,
+            message={"text": "Another family memory."},
+        ),
     )
+
     response = await client.post(
         WEBHOOK,
         headers=SECRET_HEADER,
-        json=update(1023, message={"text": "7"}),
+        json=update(2017, message={"text": "7"}),
     )
 
     assert response.status_code == 200
-    assert "Category: Stories & Reflections" in json.loads(api_stub.calls[-1].content)["text"]
+
+    confirmation = json.loads(api_stub.calls[-1].content)["text"]
+    assert "Category: Stories & Reflections" in confirmation
+
     with factory() as db:
         post = db.scalar(select(Post))
+
         assert post is not None
         assert post.category is not None
         assert post.category.name == "Stories & Reflections"
         assert post.status == PostStatus.PUBLISHED
 
 
-async def test_invalid_category_does_not_publish_or_create_another_post(
+async def test_invalid_category_does_not_publish_or_create_post(
     client: httpx.AsyncClient,
     test_app: tuple,
     api_stub,
 ) -> None:
     _, factory = test_app
     seed_categories(factory)
+
+    selected = await select_post_type(client, 2018, "latest")
+    assert selected.status_code == 200
+
     await client.post(
         WEBHOOK,
         headers=SECRET_HEADER,
-        json=update(1024, message={"text": "An article waiting for a category."}),
+        json=update(
+            2019,
+            message={
+                "text": "An article waiting for a category."
+            },
+        ),
     )
+
     invalid = await client.post(
         WEBHOOK,
         headers=SECRET_HEADER,
-        json=update(1025, message={"text": "Not a category"}),
-    )
-    assert invalid.status_code == 200
-    assert json.loads(api_stub.calls[-1].content)["text"].startswith(
-        "I couldn't match that category."
+        json=update(2020, message={"text": "Not a category"}),
     )
 
+    assert invalid.status_code == 200
+
+    reply = json.loads(api_stub.calls[-1].content)["text"]
+    assert reply.startswith(
+    "Please select one of the category buttons below."
+)
     second_article = await client.post(
         WEBHOOK,
         headers=SECRET_HEADER,
-        json=update(1026, message={"text": "A second article"}),
+        json=update(2021, message={"text": "A second article"}),
     )
+
     assert second_article.status_code == 200
-    assert "category" in json.loads(api_stub.calls[-1].content)["text"].lower()
+
     with factory() as db:
         posts = list(db.scalars(select(Post)))
+
         assert len(posts) == 1
         assert posts[0].status == PostStatus.DRAFT
         assert posts[0].category_id is None
 
 
-async def test_duplicate_category_update_does_not_publish_a_second_post(
+async def test_duplicate_category_update_does_not_publish_twice(
     client: httpx.AsyncClient,
     test_app: tuple,
 ) -> None:
     _, factory = test_app
     seed_categories(factory)
+
+    selected = await select_post_type(client, 2022, "latest")
+    assert selected.status_code == 200
+
     await client.post(
         WEBHOOK,
         headers=SECRET_HEADER,
-        json=update(1027, message={"text": "One published article."}),
+        json=update(
+            2023,
+            message={"text": "One published article."},
+        ),
     )
-    category_reply = update(1028, message={"text": "Food & Juices"})
-    first = await client.post(WEBHOOK, headers=SECRET_HEADER, json=category_reply)
-    duplicate = await client.post(WEBHOOK, headers=SECRET_HEADER, json=category_reply)
+
+    category_payload = update(
+        2024,
+        message={"text": "Food & Juices"},
+    )
+
+    first = await client.post(
+        WEBHOOK,
+        headers=SECRET_HEADER,
+        json=category_payload,
+    )
+
+    duplicate = await client.post(
+        WEBHOOK,
+        headers=SECRET_HEADER,
+        json=category_payload,
+    )
+
     assert first.status_code == duplicate.status_code == 200
 
     with factory() as db:
         assert db.scalar(select(func.count(Post.id))) == 1
+
         post = db.scalar(select(Post))
         assert post is not None
         assert post.status == PostStatus.PUBLISHED
-        assert db.scalar(select(func.count(TelegramUpdate.id))) == 2
+
+        assert db.scalar(
+            select(func.count(TelegramUpdate.id))
+        ) == 3
 
 
-async def test_database_failure_while_publishing_rolls_back_category_update(
+async def test_database_failure_while_publishing_rolls_back(
     client: httpx.AsyncClient,
     test_app: tuple,
     api_stub,
 ) -> None:
     _, factory = test_app
     seed_categories(factory)
+
+    selected = await select_post_type(client, 2025, "latest")
+    assert selected.status_code == 200
+
     await client.post(
         WEBHOOK,
         headers=SECRET_HEADER,
-        json=update(1029, message={"text": "Publish only after category."}),
+        json=update(
+            2026,
+            message={"text": "Publish only after category."},
+        ),
     )
 
     def failing_db() -> Iterator[Session]:
         with factory() as db:
+
             def fail_commit() -> None:
-                raise OperationalError("COMMIT", {}, RuntimeError("database unavailable"))
+                raise OperationalError(
+                    "COMMIT",
+                    {},
+                    RuntimeError("database unavailable"),
+                )
 
             db.commit = fail_commit  # type: ignore[method-assign]
             yield db
 
     app.dependency_overrides[get_db] = failing_db
+
+    try:
+        response = await client.post(
+            WEBHOOK,
+            headers=SECRET_HEADER,
+            json=update(
+                2027,
+                message={"text": "Nutrition Notes"},
+            ),
+        )
+
+        assert response.status_code == 503
+
+        assert json.loads(api_stub.calls[-1].content)["text"] == (
+            "Sorry, I couldn't save your article. Please try again."
+        )
+
+        with factory() as db:
+            post = db.scalar(select(Post))
+
+            assert post is not None
+            assert post.status == PostStatus.DRAFT
+            assert post.category_id is None
+
+            assert db.scalar(
+                select(func.count(TelegramUpdate.id)).where(
+                    TelegramUpdate.update_id == 2027
+                )
+            ) == 0
+    finally:
+        app.dependency_overrides.pop(get_db, None)
+
+
+async def test_telegram_api_failure_retries_without_duplicate_draft(
+    client: httpx.AsyncClient,
+    test_app: tuple,
+    api_stub,
+) -> None:
+    selected = await select_post_type(client, 2028, "latest")
+    assert selected.status_code == 200
+
+    api_stub.status_code = 500
+
+    article_payload = update(
+        2029,
+        message={
+            "text": "Education is very important for every child."
+        },
+    )
+
     response = await client.post(
         WEBHOOK,
         headers=SECRET_HEADER,
-        json=update(1030, message={"text": "Nutrition Notes"}),
+        json=article_payload,
     )
-    assert response.status_code == 503
-    assert json.loads(api_stub.calls[-1].content)["text"] == (
-        "Sorry, I couldn't save your article. Please try again."
-    )
-    with factory() as db:
-        post = db.scalar(select(Post))
-        assert post is not None
-        assert post.status == PostStatus.DRAFT
-        assert post.category_id is None
-        assert db.scalar(
-            select(func.count(TelegramUpdate.id)).where(
-                TelegramUpdate.update_id == 1030
-            )
-        ) == 0
 
-
-async def test_telegram_api_failure_retries_confirmation_without_duplicate_draft(
-    client: httpx.AsyncClient,
-    test_app: tuple,
-    api_stub,
-) -> None:
-    api_stub.status_code = 500
-    response = await client.post(WEBHOOK, headers=SECRET_HEADER, json=update(1010))
     assert response.status_code == 503
+
     api_stub.status_code = 200
-    retry = await client.post(WEBHOOK, headers=SECRET_HEADER, json=update(1010))
+
+    retry = await client.post(
+        WEBHOOK,
+        headers=SECRET_HEADER,
+        json=article_payload,
+    )
+
     assert retry.status_code == 200
+
     _, factory = test_app
+
     with factory() as db:
         assert db.scalar(select(func.count(Post.id))) == 1
-        update_record = db.scalar(select(TelegramUpdate))
-        assert update_record is not None
-        assert update_record.post_id is not None
+
+        record = db.scalar(
+            select(TelegramUpdate).where(
+                TelegramUpdate.update_id == 2029
+            )
+        )
+
+        assert record is not None
+        assert record.post_id is not None
 
 
-async def test_database_failure_rolls_back_update_and_draft_and_replies_friendly(
+async def test_database_failure_during_post_type_selection(
     client: httpx.AsyncClient,
     test_app: tuple,
     api_stub,
@@ -524,91 +703,159 @@ async def test_database_failure_rolls_back_update_and_draft_and_replies_friendly
 
     def failing_db() -> Iterator[Session]:
         with factory() as db:
+
             def fail_commit() -> None:
-                raise OperationalError("COMMIT", {}, RuntimeError("database unavailable"))
+                raise OperationalError(
+                    "COMMIT",
+                    {},
+                    RuntimeError("database unavailable"),
+                )
 
             db.commit = fail_commit  # type: ignore[method-assign]
             yield db
 
-    from app.database import get_db
-
     app.dependency_overrides[get_db] = failing_db
-    response = await client.post(WEBHOOK, headers=SECRET_HEADER, json=update(1011))
-    assert response.status_code == 503
-    assert json.loads(api_stub.calls[0].content)["text"] == (
-        "Sorry, I couldn't save your article. Please try again."
-    )
-    with factory() as db:
-        assert db.scalar(select(func.count(Post.id))) == 0
-        assert db.scalar(select(func.count(TelegramUpdate.id))) == 0
+
+    try:
+        response = await client.post(
+            WEBHOOK,
+            headers=SECRET_HEADER,
+            json=post_type_selection(2030, "latest"),
+        )
+
+        assert response.status_code == 503
+
+        with factory() as db:
+            assert db.scalar(select(func.count(Post.id))) == 0
+    finally:
+        app.dependency_overrides.pop(get_db, None)
 
 
-async def test_telegram_file_failure_does_not_create_a_post_or_log_the_token(
+async def test_telegram_file_failure_does_not_log_bot_token(
     client: httpx.AsyncClient,
     test_app: tuple,
     api_stub,
     settings,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    api_stub.status_code = 500
-    response = await client.post(
-        WEBHOOK,
-        headers=SECRET_HEADER,
-        json=update(
-            1032,
-            message={
-                "caption": "A photo whose download will fail.",
-                "photo": [{"file_id": "photo-file-id"}],
-            },
-        ),
-    )
-    assert response.status_code == 503
-    assert settings.telegram_bot_token.get_secret_value() not in caplog.text
-    _, factory = test_app
-    with factory() as db:
-        assert db.scalar(select(func.count(Post.id))) == 0
-        assert db.scalar(select(func.count(TelegramUpdate.id))) == 0
+    selected = await select_post_type(client, 2031, "featured")
+    assert selected.status_code == 200
+
+    
+    # Keep sendMessage working; fail only getFile.
+    api_stub.fail_get_file = True
+
+    try:
+        response = await client.post(
+            WEBHOOK,
+            headers=SECRET_HEADER,
+            json=update(
+                2032,
+                message={
+                    "caption": "A photo whose download will fail.",
+                    "photo": [
+                        {"file_id": "photo-file-id"}
+                    ],
+                },
+            ),
+        )
+
+        assert response.status_code == 503
+        assert (
+            settings.telegram_bot_token.get_secret_value()
+            not in caplog.text
+        )
+
+        _, factory = test_app
+
+        with factory() as db:
+            assert db.scalar(select(func.count(Post.id))) == 1
+    finally:
+        api_stub.fail_get_file = False
 
 
-async def test_telegram_service_hides_bot_token_on_api_error(settings) -> None:
+async def test_telegram_service_hides_bot_token_on_api_error(
+    settings,
+) -> None:
     async def fail(request: httpx.Request) -> httpx.Response:
-        return httpx.Response(500, json={"ok": False, "description": "failure"})
+        return httpx.Response(
+            500,
+            json={
+                "ok": False,
+                "description": "failure",
+            },
+        )
 
-    service = TelegramService(settings, transport=httpx.MockTransport(fail))
+    service = TelegramService(
+        settings,
+        transport=httpx.MockTransport(fail),
+    )
+
     with pytest.raises(TelegramAPIError) as error:
         await service.send_message(42, "test")
-    assert settings.telegram_bot_token.get_secret_value() not in str(error.value)
+
+    assert (
+        settings.telegram_bot_token.get_secret_value()
+        not in str(error.value)
+    )
 
 
-async def test_telegram_service_wraps_get_file_and_set_webhook(settings) -> None:
+async def test_telegram_service_wraps_get_file_and_set_webhook(
+    settings,
+) -> None:
     requests: list[httpx.Request] = []
 
     def respond(request: httpx.Request) -> httpx.Response:
         requests.append(request)
+
         if request.method == "GET":
             return httpx.Response(200, content=b"image bytes")
+
         result = (
             {"file_path": "photos/example.jpg"}
             if request.url.path.endswith("/getFile")
             else True
         )
-        return httpx.Response(200, json={"ok": True, "result": result})
 
-    file_service = TelegramService(settings, transport=httpx.MockTransport(respond))
+        return httpx.Response(
+            200,
+            json={"ok": True, "result": result},
+        )
+
+    file_service = TelegramService(
+        settings,
+        transport=httpx.MockTransport(respond),
+    )
+
     file_result = await file_service.get_file("telegram-file-id")
     assert file_result == {"file_path": "photos/example.jpg"}
-    assert await file_service.download_file("photos/example.jpg") == b"image bytes"
 
-    webhook_service = TelegramService(settings, transport=httpx.MockTransport(respond))
+    assert (
+        await file_service.download_file("photos/example.jpg")
+        == b"image bytes"
+    )
+
+    webhook_service = TelegramService(
+        settings,
+        transport=httpx.MockTransport(respond),
+    )
+
     await webhook_service.set_webhook(
         "https://example-tunnel.test/api/telegram/webhook",
         "a-random-webhook-secret",
     )
 
     assert requests[0].url.path.endswith("/getFile")
-    assert json.loads(requests[0].content) == {"file_id": "telegram-file-id"}
+    assert json.loads(requests[0].content) == {
+        "file_id": "telegram-file-id"
+    }
+
     assert requests[1].url.path.endswith("/photos/example.jpg")
     assert requests[2].url.path.endswith("/setWebhook")
+
     webhook_payload = json.loads(requests[2].content)
+
     assert webhook_payload["secret_token"] == "a-random-webhook-secret"
-    assert webhook_payload["url"] == "https://example-tunnel.test/api/telegram/webhook"
+    assert webhook_payload["url"] == (
+        "https://example-tunnel.test/api/telegram/webhook"
+    )

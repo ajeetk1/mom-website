@@ -1,10 +1,12 @@
-from fastapi import Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, status
 
-from app.config import get_settings
+from app.config import Settings, get_settings
 
 
-def require_admin(x_admin_api_key: str | None = Header(default=None)) -> None:
-    settings = get_settings()
+def require_admin(
+    x_admin_api_key: str | None = Header(default=None),
+    settings: Settings = Depends(get_settings),
+) -> None:
     configured_key = settings.admin_api_key
 
     if configured_key is None or not configured_key.get_secret_value().strip():

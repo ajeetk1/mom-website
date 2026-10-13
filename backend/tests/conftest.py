@@ -20,17 +20,27 @@ from app.services.telegram import TelegramService
 class TelegramAPIStub:
     status_code: int = 200
     calls: list[httpx.Request] = field(default_factory=list)
+    fail_get_file: bool = False
 
     def transport(self) -> httpx.MockTransport:
         def handle(request: httpx.Request) -> httpx.Response:
             self.calls.append(request)
             if request.method == "GET":
-                return httpx.Response(200, content=b"telegram image bytes")
-            result = (
-                {"file_path": "photos/example.jpg"}
-                if request.url.path.endswith("/getFile")
-                else {}
-            )
+               return httpx.Response(200, content=b"telegram image bytes")
+
+            if request.url.path.endswith("/getFile"):
+               if self.fail_get_file:
+                return httpx.Response(
+            500,
+            json={
+                "ok": False,
+                "description": "simulated file failure",
+            },
+        )
+
+               result = {"file_path": "photos/example.jpg"}
+            else:
+               result = {}
             return httpx.Response(
                 self.status_code,
                 json={"ok": self.status_code < 400, "result": result},
@@ -47,11 +57,12 @@ def api_stub() -> TelegramAPIStub:
 @pytest.fixture
 def settings() -> Settings:
     return Settings(
-        database_url="sqlite+pysqlite:///:memory:",
-        telegram_bot_token="test-token-not-real",
-        telegram_webhook_secret="test-webhook-secret",
-        telegram_allowed_user_id=42,
-    )
+    database_url="sqlite+pysqlite:///:memory:",
+    telegram_bot_token="test-token-not-real",
+    telegram_webhook_secret="test-webhook-secret",
+    telegram_allowed_user_id=42,
+    admin_api_key="test-admin-key",
+)
 
 
 @pytest.fixture

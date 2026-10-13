@@ -4,6 +4,7 @@ import logging
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from cloudinary.exceptions import Error as CloudinaryError
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import ValidationError
@@ -576,7 +577,7 @@ async def telegram_webhook(
                 telegram_file_path,
             )
 
-        except (TelegramAPIError, OSError):
+        except (TelegramAPIError, OSError, CloudinaryError):
             logger.exception(
                 "Could not save Telegram image for update %s",
                 payload.update_id,
@@ -801,6 +802,7 @@ async def _save_post_step(
             detail="The article could not be saved",
         ) from None
 
+    
     try:
         await telegram.send_message(
             chat_id,
@@ -808,12 +810,17 @@ async def _save_post_step(
             reply_markup=reply_markup,
         )
     except TelegramAPIError:
-        logger.warning(
-            "Draft saved but next-step prompt failed for update %s",
+        logger.exception(
+            "Could not send Telegram response for update %s",
             update_id,
         )
+        raise HTTPException(
+            status_code=503,
+            detail="Could not send Telegram response",
+        ) from None
 
     return {"ok": True}
+
 
 
 def _record_update(
@@ -1158,11 +1165,16 @@ async def _record_and_reply(
             reply,
             reply_markup=reply_markup,
         )
+    
     except TelegramAPIError:
-        logger.warning(
+        logger.exception(
             "Could not send Telegram response for update %s",
             update_id,
         )
+        raise HTTPException(
+            status_code=503,
+            detail="Could not send Telegram response",
+        ) from None
 
     return {"ok": True}
 

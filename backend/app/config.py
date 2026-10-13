@@ -12,6 +12,11 @@ class Settings(BaseSettings):
     telegram_webhook_secret: SecretStr | None = None
     telegram_allowed_user_id: int | None = Field(default=None, gt=0)
 
+    #Cloudinary image storage
+    cloudinary_cloud_name: str | None = None
+    cloudinary_api_key: str | None = None
+    cloudinary_api_secret: SecretStr | None = None
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
