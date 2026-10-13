@@ -105,8 +105,10 @@ def health_check() -> dict[str, str]:
 app.include_router(posts_router)
 app.include_router(categories_router)
 app.include_router(telegram_router)
+UPLOAD_DIRECTORY.mkdir(parents=True, exist_ok=True)
+
 app.mount(
     "/uploads",
-    StaticFiles(directory=str(UPLOAD_DIRECTORY), check_dir=False),
+    StaticFiles(directory=str(UPLOAD_DIRECTORY)),
     name="uploads",
 )
