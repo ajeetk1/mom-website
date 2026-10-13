@@ -593,13 +593,15 @@ async def telegram_webhook(
                 detail="The photo could not be saved",
             ) from None
 
+        
         pending_post.featured_image_url = image_url
         pending_post.telegram_file_id = file_id
 
-        if caption:
-            pending_post.title = caption[:255]
-        elif pending_post.post_type == PostType.ARCHIVE:
+        if pending_post.post_type == PostType.ARCHIVE:
             pending_post.title = ARCHIVE_PLACEHOLDER
+            pending_post.content = ""
+        elif caption:
+            pending_post.title = caption[:255]
 
         try:
             _record_update(db, payload.update_id, pending_post.id)
@@ -621,6 +623,17 @@ async def telegram_webhook(
                 status_code=503,
                 detail="The photo could not be saved to the draft",
             ) from None
+
+        if pending_post.post_type == PostType.ARCHIVE:
+            return await _save_post_step(
+                db=db,
+                update_id=payload.update_id,
+                post=pending_post,
+                telegram=telegram,
+                chat_id=chat_id,
+                reply=CATEGORY_MESSAGE,
+                reply_markup=_category_keyboard(db),
+            )
 
         prompt = (
             "Great! 👍\n\nNow send me the article text."
@@ -739,9 +752,8 @@ async def _handle_post_type_selection(
             "The first line will be used as the title."
         ),
         PostType.ARCHIVE: (
-            "🖼️ Image with Text selected!\n\n"
-            "Send the photo first. A caption is optional. "
-            "Then send the article text."
+            "🖼️ From the Archive selected!\n\n"
+            "Send an image only. No text or caption is needed."
         ),
     }
 
@@ -1061,7 +1073,10 @@ async def _handle_category(
 
     post = _get_pending_post(db)
 
-    if post is None or not post.content.strip():
+    if post is None or (
+    post.post_type != PostType.ARCHIVE
+    and not post.content.strip()
+    ):
         return await _record_and_reply(
             db,
             update_id,
