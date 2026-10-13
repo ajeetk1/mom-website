@@ -630,15 +630,23 @@ async def telegram_webhook(
             PostType.ARCHIVE,
             PostType.FEATURED,
         ):
-            return await _save_post_step(
-                db=db,
-                update_id=payload.update_id,
-                post=pending_post,
-                telegram=telegram,
-                chat_id=chat_id,
-                reply=CATEGORY_MESSAGE,
-                reply_markup=_category_keyboard(db),
-            )
+            try:
+                await telegram.send_message(
+                    chat_id,
+                    CATEGORY_MESSAGE,
+                    reply_markup=_category_keyboard(db),
+                )
+            except TelegramAPIError:
+                logger.exception(
+                    "Could not send category prompt for update %s",
+                    payload.update_id,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="Could not send category prompt",
+                ) from None
+
+            return {"ok": True}
 
         prompt = (
             "Great! 👍\n\nNow send me the article text."
