@@ -401,6 +401,18 @@ async def telegram_webhook(
     command = _command(message.text)
 
     if command == "/start":
+        pending_post = _get_pending_post(db)
+
+        if pending_post is not None:
+            db.query(TelegramUpdate).filter(
+                TelegramUpdate.post_id == pending_post.id
+            ).update(
+                {TelegramUpdate.post_id: None},
+                synchronize_session=False,
+            )
+            db.delete(pending_post)
+            db.flush()
+
         return await _record_and_reply(
             db,
             payload.update_id,

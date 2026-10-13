@@ -287,6 +287,61 @@ async def test_message_without_post_type_requests_selection(
         assert db.scalar(select(func.count(Post.id))) == 0
 
 
+async def test_start_discards_unfinished_draft(
+    client: httpx.AsyncClient,
+    test_app: tuple,
+    api_stub,
+) -> None:
+    _, factory = test_app
+    seed_categories(factory)
+
+    # Create an unfinished Latest draft.
+    selected = await select_post_type(client, 2040, "latest")
+    assert selected.status_code == 200
+
+    draft_response = await client.post(
+        WEBHOOK,
+        headers=SECRET_HEADER,
+        json=update(
+            2041,
+            message={"text": "This unfinished article should be discarded."},
+        ),
+    )
+    assert draft_response.status_code == 200
+
+    with factory() as db:
+        draft = db.scalar(select(Post))
+        assert draft is not None
+        draft_id = draft.id
+
+    # /start should discard the draft and show the post-type keyboard.
+    start_response = await client.post(
+        WEBHOOK,
+        headers=SECRET_HEADER,
+        json=update(2042, message={"text": "/start"}),
+    )
+    assert start_response.status_code == 200
+
+    with factory() as db:
+        assert db.get(Post, draft_id) is None
+
+        # Telegram update records should remain for duplicate protection.
+        original_update = db.scalar(
+            select(TelegramUpdate).where(
+                TelegramUpdate.update_id == 2041
+            )
+        )
+        assert original_update is not None
+        assert original_update.post_id is None
+
+    reply = json.loads(api_stub.calls[-1].content)
+    assert reply["text"] == (
+        "Welcome! 👋\n\nWhat would you like to publish today?"
+    )
+    assert "reply_markup" in reply
+
+
+
 async def test_start_command_shows_post_type_keyboard(
     client: httpx.AsyncClient,
     api_stub,
