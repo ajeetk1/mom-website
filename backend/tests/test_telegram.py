@@ -624,8 +624,15 @@ async def test_database_failure_while_publishing_rolls_back(
 
         assert response.status_code == 503
 
-        assert json.loads(api_stub.calls[-1].content)["text"] == (
+        sent_texts = [
+            json.loads(call.content).get("text")
+            for call in api_stub.calls
+            if call.url.path.endswith("/sendMessage")
+        ]
+
+        assert (
             "Sorry, I couldn't save your article. Please try again."
+            not in sent_texts
         )
 
         with factory() as db:

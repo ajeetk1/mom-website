@@ -1183,15 +1183,16 @@ async def _record_and_reply(
 # Error handling
 # =========================================================
 
+
 async def _send_save_failure(
     telegram: TelegramService,
     chat_id: int,
     update_id: int,
 ) -> None:
-    try:
-        await telegram.send_message(chat_id, SAVE_FAILED_MESSAGE)
-    except TelegramAPIError:
-        logger.warning("Could not send save failure for update %s", update_id)
+    logger.warning(
+        "Save failure occurred for update %s; generic failure message suppressed",
+        update_id,
+    )
 
 
 async def _send_image_save_failure(
