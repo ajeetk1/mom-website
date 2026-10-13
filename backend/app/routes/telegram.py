@@ -1233,6 +1233,7 @@ def _update_exists(db: Session, update_id: int) -> bool:
     )
 
 
+
 async def _retry_confirmation(
     db: Session,
     update_id: int,
@@ -1254,12 +1255,31 @@ async def _retry_confirmation(
         return {"ok": True}
 
     try:
-        if post.status == PostStatus.PUBLISHED and post.category_id is not None:
+        if (
+            post.status == PostStatus.PUBLISHED
+            and post.category_id is not None
+        ):
             category = db.get(Category, post.category_id)
+
             if category is not None:
                 await _send_published_confirmation(
                     telegram, chat_id, post, category
                 )
+
+        elif (
+            post.status == PostStatus.DRAFT
+            and post.featured_image_url is not None
+            and post.post_type in (
+                PostType.ARCHIVE,
+                PostType.FEATURED,
+            )
+        ):
+            await telegram.send_message(
+                chat_id,
+                CATEGORY_MESSAGE,
+                reply_markup=_category_keyboard(db),
+            )
+
     except TelegramAPIError:
         logger.warning(
             "Could not retry confirmation for update %s",
@@ -1267,6 +1287,7 @@ async def _retry_confirmation(
         )
 
     return {"ok": True}
+
 
 
 async def _send_published_confirmation(
