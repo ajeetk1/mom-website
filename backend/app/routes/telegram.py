@@ -1140,9 +1140,16 @@ async def _record_and_reply(
         _record_update(db, update_id)
         db.commit()
 
+    
     except IntegrityError:
         db.rollback()
+
         if _update_exists(db, update_id):
+            await telegram.send_message(
+                chat_id,
+                reply,
+                reply_markup=reply_markup,
+            )
             return {"ok": True}
 
         await _send_save_failure(telegram, chat_id, update_id)
@@ -1150,6 +1157,7 @@ async def _record_and_reply(
             status_code=503,
             detail="The update could not be processed",
         ) from None
+
 
     except SQLAlchemyError:
         db.rollback()
