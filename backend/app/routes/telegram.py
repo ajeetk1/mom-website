@@ -637,11 +637,7 @@ async def telegram_webhook(
                 detail="The photo could not be saved to the draft",
             ) from None
 
-        
-        if pending_post.post_type in (
-            PostType.ARCHIVE,
-            PostType.FEATURED,
-        ):
+        if pending_post.post_type == PostType.ARCHIVE:
             try:
                 await telegram.send_message(
                     chat_id,
@@ -659,6 +655,7 @@ async def telegram_webhook(
                 ) from None
 
             return {"ok": True}
+
 
         prompt = (
             "Great! 👍\n\nNow send me the article text."
@@ -1289,10 +1286,7 @@ async def _retry_confirmation(
         elif (
             post.status == PostStatus.DRAFT
             and post.featured_image_url is not None
-            and post.post_type in (
-                PostType.ARCHIVE,
-                PostType.FEATURED,
-            )
+            and post.post_type == PostType.ARCHIVE
         ):
             await telegram.send_message(
                 chat_id,
